@@ -1,284 +1,147 @@
+"""Train TinyViT-21m on CUB‑200‑2011."""
+
 import os
+from pathlib import Path
 import pandas as pd
 from PIL import Image
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
-import torchvision.models as models
-import torchvision.utils as vutils
-from torchvision.models.efficientnet import EfficientNet_V2_S_Weights
+from torch.utils.tensorboard import SummaryWriter
 
+import timm
 
-# -----------------------------
-# Configuration & Hyperparameters
-# -----------------------------
-DATASET_PATH = "CUB_200_2011"
-IMAGES_FOLDER = os.path.join(DATASET_PATH, "images")
+# paths
+DATA_ROOT    = Path("./CUB_200_2011")
+IMAGES_FILE  = DATA_ROOT / "images.txt"
+SPLIT_FILE   = DATA_ROOT / "train_test_split.txt"
+BBOX_FILE    = DATA_ROOT / "bounding_boxes.txt"
+IMAGES_DIR   = DATA_ROOT / "images"
 
-BB_FILE = os.path.join(DATASET_PATH, "bounding_boxes.txt")
-IMAGES_FILE = os.path.join(DATASET_PATH, "images.txt")
-LABELS_FILE = os.path.join(DATASET_PATH, "image_class_labels.txt")
-SPLIT_FILE = os.path.join(DATASET_PATH, "train_test_split.txt")
+# hyper‑params
+IMG_SIZE     = 384
+BATCH        = 32
+N_WORKERS    = 4
+SMOOTH       = 0.1
 
-IMG_SIZE = 384
-BATCH_SIZE = 32
-FREEZE_EPOCHS = 6  # Phase 1 epochs
-STAGE_TWO = 44  # Phase 2 epochs
-STAGE_THREE = 12 # Phase 3 epochs
+FREEZE_EPOCH = 5
+PART_EPOCH   = 20
+FULL_EPOCH   = 10
 
-# -----------------------------
-# Custom Dataset
-# -----------------------------
-class CUBDataset(Dataset):
-    def __init__(self, dataframe, images_folder, img_size, training=True):
-        self.df = dataframe.reset_index(drop=True)
-        self.images_folder = images_folder
-        self.img_size = img_size
-        self.training = training
-
-        # Define transforms: augmentations for training, basic resize for validation
-        if self.training:
-            self.transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(.4),
-                transforms.RandomRotation(.25),
-                transforms.ColorJitter(brightness=.3,contrast=.23,saturation=.2,hue=.2),
-                transforms.Resize((img_size, img_size)),
+class CUB(Dataset):
+    def __init__(self, df, img_dir, size, train=True):
+        self.df, self.dir, self.size, self.train = df.reset_index(drop=True), img_dir, size, train
+        if train:
+            self.tf = transforms.Compose([
+                transforms.RandomResizedCrop(size, scale=(0.5,1.0)),
+                transforms.RandAugment(num_ops=2, magnitude=9),
                 transforms.ToTensor(),
-                transforms.RandomErasing(.2),
-                transforms.Normalize(mean=[.485, .456, .406], std=[.229, .224, .225])
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.RandomErasing(p=0.25)
             ])
+
         else:
-            self.transform = transforms.Compose([
-                transforms.Resize((img_size, img_size)),
+            self.tf = transforms.Compose([
+                transforms.Resize((size,size)),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[.485, .456, .406], std=[.229, .224, .225])
+                transforms.Normalize(mean=[0.485,0.456,0.406],std=[0.229,0.224,0.225])
             ])
-
     def __len__(self):
         return len(self.df)
+    def __getitem__(self, i):
+        r   = self.df.iloc[i]
+        img = Image.open(self.dir / r.path).convert("RGB")
+        if not pd.isna(r.x):
+            x,y,w,h = map(int,[r.x,r.y,r.bb_width,r.bb_height])
+            img = img.crop((x,y,x+w,y+h))
+        return self.tf(img), int(r.class_id)-1
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        image_path = os.path.join(self.images_folder, row['path'])
-        label = int(row['class_label'])
-        x, y, w, h = int(row['x']), int(row['y']), int(row['w']), int(row['h'])
+def freeze_bn(m):
+    for mod in m.modules():
+        if isinstance(mod, nn.BatchNorm2d):
+            mod.eval()
+            for p in mod.parameters():
+                p.requires_grad_(False)
 
-        # Open the image and ensure it is RGB
-        with Image.open(image_path) as img:
-            img = img.convert("RGB")
-            width, height = img.size
-            # Ensure the bounding box is valid
-            x = min(x, width - 1)
-            y = min(y, height - 1)
-            w = min(w, width - x)
-            h = min(h, height - y)
-            # Crop: (left, upper, right, lower)
-            cropped = img.crop((x, y, x + w, y + h))
+def acc(out, tgt):
+    return (out.argmax(1)==tgt).float().mean()
 
-        image = self.transform(cropped)
-        return image, label
+def run_epoch(model, loader, crit, opt, train, dev):
+    if train:
+        model.train()
+    else:
+        model.eval()
+    loss_tot = correct = n = 0
+    with torch.set_grad_enabled(train):
+        for x,y in loader:
+            x,y = x.to(dev), y.to(dev)
+            if train: opt.zero_grad()
+            out = model(x)
+            loss = crit(out,y)
+            if train:
+                loss.backward(); opt.step()
+            bs = x.size(0)
+            loss_tot += loss.item()*bs
+            correct  += (out.argmax(1)==y).sum().item()
+            n += bs
+    return loss_tot/n, correct/n
 
 def main():
-    # -----------------------------
-    # Load and Prepare CSV Data
-    # -----------------------------
-    images_df = pd.read_csv(IMAGES_FILE, sep=" ", header=None, names=["image_id", "path"])
-    labels_df = pd.read_csv(LABELS_FILE, sep=" ", header=None, names=["image_id", "label"])
-    split_df = pd.read_csv(SPLIT_FILE, sep=" ", header=None, names=["image_id", "is_train"])
-    bboxes_df = pd.read_csv(BB_FILE, sep=" ", header=None, names=["image_id", "x", "y", "w", "h"])
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # data
+    df   = (pd.read_csv(IMAGES_FILE,sep=' ',header=None,names=['id','path'])
+            .merge(pd.read_csv(SPLIT_FILE,sep=' ',header=None,names=['id','is_train']))
+            .merge(pd.read_csv(BBOX_FILE,sep=' ',header=None,
+                               names=['id','x','y','bb_width','bb_height'])))
+    train_df, val_df = df[df.is_train==1], df[df.is_train==0]
+    train_dl = DataLoader(CUB(train_df, IMAGES_DIR, IMG_SIZE, True),
+                          batch_size=BATCH, shuffle=True, num_workers=N_WORKERS, pin_memory=True)
+    val_dl   = DataLoader(CUB(val_df,   IMAGES_DIR, IMG_SIZE, False),
+                          batch_size=BATCH, shuffle=False, num_workers=N_WORKERS, pin_memory=True)
+    # model
+    model = timm.create_model('tiny_vit_21m_384', pretrained=True, num_classes=200).to(dev)
+    crit  = nn.CrossEntropyLoss(label_smoothing=SMOOTH)
+    writer= SummaryWriter('runs/tinyvit')
+    best  = 0
 
-    # Merge into one DataFrame
-    df = images_df.merge(labels_df, on="image_id").merge(split_df, on="image_id").merge(bboxes_df, on="image_id")
-    df["class_label"] = df["label"] - 1  # Convert to 0-based labels
-    unique_labels = sorted(df["label"].unique())
-    num_classes = len(unique_labels)
+    def stage(epochs, unfreeze):
+        if unfreeze=='head':
+            for n,p in model.named_parameters():
+                p.requires_grad_(n.startswith('head'))
+            freeze_bn(model)
+            opt = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=3e-4, weight_decay=1e-2,)
+            total_steps = len(train_dl) * epochs
+            sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=3e-4, total_steps=total_steps, pct_start=0.3,
+                                                      div_factor=25)
+        elif unfreeze=='partial':
+            for n,p in model.named_parameters():
+                p.requires_grad_(('blocks.9' in n) or n.startswith('head'))
+            opt = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=5e-3)
+            sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=max(epochs // 2, 1), T_mult=1)
+        else:
+            for p in model.parameters():
+                p.requires_grad_(True)
+            opt = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=3e-5, weight_decay=1e-4)
+            sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=len(train_dl) * epochs, eta_min=1e-6)
+        nonlocal best
 
-    # Split train/validation
-    train_df = df[df["is_train"] == 1]
-    val_df = df[df["is_train"] == 0]
-    val_df = df[df["is_train"] == 0]
+        for e in range(epochs):
+            tr_loss,tr_acc = run_epoch(model, train_dl, crit, opt, True, dev)
+            val_loss,val_acc= run_epoch(model, val_dl, crit, opt, False, dev)
+            sch.step(e)
+            writer.add_scalars('loss',{'train':tr_loss,'val':val_loss},writer._get_next_global_step())
+            writer.add_scalars('acc', {'train':tr_acc,'val':val_acc},writer._get_next_global_step())
+            if val_acc>best:
+                best=val_acc
+                torch.save(model.state_dict(),'best_tinyvit_cub.pth')
+            print(f"e{e+1:02d} {tr_acc:.3f}/{val_acc:.3f}")
 
-    print(f"Number of classes: {num_classes}")
+    stage(FREEZE_EPOCH,'head')
+    stage(PART_EPOCH,'partial')
+    stage(FULL_EPOCH,'full')
 
-    # -----------------------------
-    # Create datasets and DataLoaders
-    # -----------------------------
-    train_dataset = CUBDataset(train_df, IMAGES_FOLDER, IMG_SIZE, training=True)
-    val_dataset = CUBDataset(val_df, IMAGES_FOLDER, IMG_SIZE, training=False)
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-
-    # -----------------------------
-    # Build the Model
-    # -----------------------------
-    model = models.efficientnet_v2_s(weights=EfficientNet_V2_S_Weights.IMAGENET1K_V1)
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.39), # adjust
-        nn.Linear(in_features, num_classes)
-    )
-
-    # Move model to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    # Freeze the base feature extractor for phase 1
-    for param in model.features.parameters():
-        param.requires_grad = False
-
-    # -----------------------------
-    # Loss, Optimizer, and Scheduler Setup
-    # -----------------------------
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=7e-4, weight_decay=.0005)
-    scheduler = ExponentialLR(optimizer, gamma=0.98)
-
-    # -----------------------------
-    # TensorBoard Setup
-    # -----------------------------
-    writer = SummaryWriter(log_dir="runs/experiment1")
-
-    # -----------------------------
-    # Training and Validation Functions
-    # -----------------------------
-    def train_epoch(model, loader, criterion, optimizer, device):
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        for i, (images, labels) in enumerate(loader):
-            images = images.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * images.size(0)
-            _, preds = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (preds == labels).sum().item()
-
-            if i % 100 == 0:
-                img_grid = vutils.make_grid(images[:16], nrow=4, normalize=True)
-                writer.add_image("training images",img_grid)
-
-        return running_loss / total, correct / total
-
-    def validate_epoch(model, loader, criterion, device):
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for images, labels in loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                running_loss += loss.item() * images.size(0)
-                _, preds = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (preds == labels).sum().item()
-        return running_loss / total, correct / total
-
-    # -----------------------------
-    # Phase 1: Training with Frozen Base
-    # -----------------------------
-    print("\n=====================")
-    print("Phase 1: Training with frozen base features")
-    for epoch in range(FREEZE_EPOCHS):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
-        scheduler.step()
-
-        print(f"Epoch {epoch + 1}/{FREEZE_EPOCHS} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-
-        # Log metrics to TensorBoard
-        writer.add_scalar("Loss/Train", train_loss, epoch)
-        writer.add_scalar("Accuracy/Train", train_acc, epoch)
-        writer.add_scalar("Loss/Validation", val_loss, epoch)
-        writer.add_scalar("Accuracy/Validation", val_acc, epoch)
-
-    # -----------------------------
-    # Phase 2: Fine-tuning (Unfreeze last 10 layers of base)
-    # -----------------------------
-    features_children = list(model.features.children())
-    for layer in features_children[-4:]:
-        for param in layer.parameters():
-            param.requires_grad = True
-
-    optimizer = optim.Adam(model.parameters(), lr=1e-5, weight_decay=.0027)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode= 'min', factor= .1, patience=2, verbose= True)
-
-
-    print("\n=====================")
-    print("Phase 2: Fine-tuning the network")
-    for epoch in range(STAGE_TWO):
-        global_epoch = FREEZE_EPOCHS + epoch
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
-        scheduler.step(val_loss )
-
-        print(f"Epoch {global_epoch + 1}/{FREEZE_EPOCHS + STAGE_TWO + STAGE_THREE} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-
-        # Log metrics to TensorBoard
-        writer.add_scalar("Loss/Train", train_loss, global_epoch)
-        writer.add_scalar("Accuracy/Train", train_acc, global_epoch)
-        writer.add_scalar("Loss/Validation", val_loss, global_epoch)
-        writer.add_scalar("Accuracy/Validation", val_acc, global_epoch)
-
-    #final stage 3
-
-    features_children = list(model.features.children())
-    for layer in features_children[-6:]:
-        for param in layer.parameters():
-            param.requires_grad = True
-
-    optimizer = optim.Adam(model.parameters(), lr=1e-6, weight_decay=.003)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode= 'min', factor= .15, patience=2, verbose= True)
-
-
-
-    print("\n=====================")
-    print("Phase 3: ultra fine-tuning the network")
-    for epoch in range(STAGE_THREE):
-        global_epoch = FREEZE_EPOCHS + STAGE_TWO + epoch
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
-        scheduler.step(val_loss)
-
-        print(
-            f"Epoch {global_epoch + 1}/{FREEZE_EPOCHS + STAGE_TWO + STAGE_THREE} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-
-        # Log metrics to TensorBoard
-        writer.add_scalar("Loss/Train", train_loss, global_epoch)
-        writer.add_scalar("Accuracy/Train", train_acc, global_epoch)
-        writer.add_scalar("Loss/Validation", val_loss, global_epoch)
-        writer.add_scalar("Accuracy/Validation", val_acc, global_epoch)
-
-    # -----------------------------
-    # Final Evaluation and Saving
-    # -----------------------------
-    val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
-    print("\nFinal Evaluation on Validation Set")
-    print(f"Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}")
-
-    torch.save(model.state_dict(), "bird_model.pth")
-    print("Model saved as bird_model.pth")
-
-    writer.close()
-
-
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
