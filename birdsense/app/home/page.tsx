@@ -35,11 +35,12 @@ export default function HomePage() {
   const [hasMore, setHasMore] = useState(true)
   const [cursor, setCursor] = useState<string | null>(null);
   const [initialLoading, setInitialLoading] = useState(true)
+  const pageSize = 12; 
 
   const observer = useRef<IntersectionObserver>()
   const lastBirdElementRef = useCallback(
-    (node: HTMLDivElement) => {
-      if (loading) return
+    (node: HTMLDivElement | null) => {
+      if (loading || initialLoading) return
       if (observer.current) observer.current.disconnect()
       observer.current = new IntersectionObserver((entries) => {
         if (entries[0].isIntersecting && hasMore) {
@@ -71,10 +72,10 @@ export default function HomePage() {
   const loadInitialBirds = async () => {
     setInitialLoading(true)
     try {
-      const {items, nextCursor} = await fetchBirdClassifications(null,16)
+      const {items, nextCursor} = await fetchBirdClassifications(null,pageSize)
       setBirds(items);
       setCursor(nextCursor);
-      setHasMore(Boolean(nextCursor));
+      setHasMore(items.length === pageSize);
     } catch (error) {
       console.error("Failed to load initial birds:", error)
     } finally {
@@ -87,10 +88,10 @@ export default function HomePage() {
 
     setLoading(true)
     try {
-      const {items, nextCursor} = await fetchBirdClassifications(cursor, 12)
+      const {items, nextCursor} = await fetchBirdClassifications(cursor, pageSize)
       setBirds((prev) => [...prev, ...items]);
       setCursor(nextCursor);
-      setHasMore(Boolean(nextCursor));
+      setHasMore(items.length === pageSize);
     } catch (error) {
       console.error("Failed to load more birds:", error)
     } finally {
