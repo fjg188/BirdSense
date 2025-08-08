@@ -343,7 +343,7 @@ export default function HomePage() {
         {!hasMore && birds.length > 0 && (
           <div className="text-center py-12">
             <div className="space-y-2">
-              <p className="text-gray-600 font-medium">You've reached the end of the classifications!</p>
+              <p className="text-gray-600 font-medium">You have reached the end of the classifications!</p>
               <p className="text-sm text-gray-500">Showing all {filteredAndSortedBirds.length} bird detections</p>
             </div>
           </div>
