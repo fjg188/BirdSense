@@ -59,7 +59,6 @@ const observer = useRef<IntersectionObserver | null>(null)
   }, [])
 
   async function fetchBirdClassifications(cursor: string | null = null, limit = 12): Promise<apiResponse> {
-    const url = new URL(load!);
     url.searchParams.set("limit", String(limit));
     if (cursor) {
       url.searchParams.set("cursor", cursor);
