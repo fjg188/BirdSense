@@ -9,7 +9,7 @@ import { Loader2 } from "lucide-react"
 import { useState } from "react";
 import { useRouter} from "next/navigation";
 
-export default function landingPage() {
+export default function LandingPage() {
    const [pw, setPw] = useState('');
    const [err, setErr] = useState('');
    const router = useRouter();

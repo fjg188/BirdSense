@@ -27,7 +27,7 @@ export default function HomePage() {
     items: bird[];
   };
 
-  const [birds, setBirds] = useState<any[]>([])
+  const [birds, setBirds] = useState<bird[]>([])
   const [searchTerm, setSearchTerm] = useState("")
   const [sortBy, setSortBy] = useState("timestamp")
   const [filterBy, setFilterBy] = useState("all")
@@ -36,6 +36,7 @@ export default function HomePage() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [initialLoading, setInitialLoading] = useState(true)
   const pageSize = 12; 
+  const load = process.env.NEXT_PUBLIC_LOAD_API_URL
 
   const observer = useRef<IntersectionObserver>()
   const lastBirdElementRef = useCallback(
@@ -58,7 +59,7 @@ export default function HomePage() {
   }, [])
 
   async function fetchBirdClassifications(cursor: string | null = null, limit = 12): Promise<apiResponse> {
-    const url = new URL("https://yh5oyjgccj.execute-api.us-east-2.amazonaws.com/default/load10");
+    const url = new URL(load);
     url.searchParams.set("limit", String(limit));
     if (cursor) {
       url.searchParams.set("cursor", cursor);

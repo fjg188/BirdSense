@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import timm
+import re
+import requests
 from picamera2 import Picamera2
 from ultralytics import YOLO
 from libcamera import controls
@@ -22,6 +24,10 @@ DET_WEIGHT = WEIGHTS_DIR / "yolo11n.pt"
 CLF_WEIGHT = PROJECT_DIR / "models" / "best_swin_cub.pth"
 CLASSES_FILE = PROJECT_DIR / "classes.txt"
 BACKBONE_NAME = "swin_base_patch4_window12_384"
+
+UPLOAD_URL_ENDPOINT = "https://yh5oyjgccj.execute-api.us-east-2.amazonaws.com/default/upload-URL"
+SAVE_META_ENDPOINT   = "https://yh5oyjgccj.execute-api.us-east-2.amazonaws.com/default/classify"
+TIMEOUT = 15
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -129,9 +135,33 @@ def detections_to_norfair(res) -> List[Detection]:
 
     return dets
 
+def _get_upload_url():
+    r = requests.get(UPLOAD_URL_ENDPOINT, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return data["uploadURL"], data["Key"]
 
+def _put_image(upload_url, img_bgr):
+    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError("JPEG encoding failed")
+    headers = {"Content-Type": "image/jpeg"}
+    r = requests.put(upload_url, data=buf.tobytes(), headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
 
+def _save_meta(species, conf, key):
+    payload = {
+        "species": species,
+        "confidence": float(round(conf, 4)),
+        "image": key
+    }
+    r = requests.post(SAVE_META_ENDPOINT, json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
 
+def upload_classification(crop_bgr, species, confidence):
+    upload_url, key = _get_upload_url()
+    _put_image(upload_url, crop_bgr)
+    _save_meta(species, confidence, key)
 
 # ───── Main loop ─────
 
@@ -202,15 +232,25 @@ def main():
                 x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
                 x1, y1 = max(x1, 0), max(y1, 0)
                 x2, y2 = min(x2, frame_rgb.shape[1]), min(y2, frame_rgb.shape[0])
-                crop_rgb = frame_bgr[y1:y2, x1:x2]
-                if crop_rgb.size == 0:
+                crop_bgr = frame_bgr[y1:y2, x1:x2]
+                crop_rgb = frame_rgb[y1:y2, x1:x2]
+
+                if crop_bgr.size == 0:
                     continue
-                idx, score = classify(crop_rgb)
-                if score > 0.1:
+                idx, score = classify(crop_bgr)
+                if score > 0.3:
                     label = LABELS[idx] if idx < len(LABELS) else str(idx)
                     print(f"species: {label}  confidence: {score:.2f}")
-                    cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), (0, 255, 0), 2)  # BGR green
                     cv2.putText(frame_rgb, f"{label}:{score:.2f}", (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    try:
+                        name = re.sub(r'^\d+\s*[\.\s]?\s*', '', label.strip())
+                        name = name.replace('_', ' ')
+
+                        upload_classification(crop_rgb, name, round(score * 100))
+                    except Exception as e:
+                        print(e)
+                        print('upload failed')
 
             if preview:
                 cv2.imshow("BirdCam", frame_rgb)
