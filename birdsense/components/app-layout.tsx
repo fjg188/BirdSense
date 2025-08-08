@@ -1,7 +1,6 @@
 import type React from "react"
-import { Bird, Eye, Menu, Settings, Home, BarChart3 } from "lucide-react"
+import { Bird, Eye, Settings, Home, BarChart3 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
 import Link from "next/link"
 
 interface AppLayoutProps {
