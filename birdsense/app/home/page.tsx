@@ -38,7 +38,7 @@ export default function HomePage() {
   const pageSize = 12; 
   const load = process.env.NEXT_PUBLIC_LOAD_API_URL
 
-  const observer = useRef<IntersectionObserver>()
+const observer = useRef<IntersectionObserver | null>(null)
   const lastBirdElementRef = useCallback(
     (node: HTMLDivElement | null) => {
       if (loading || initialLoading) return
