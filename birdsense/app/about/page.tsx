@@ -2,22 +2,13 @@
 
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Separator } from "@/components/ui/separator"
 import {
   Bird,
   Camera,
   Cpu,
   Code,
   Database,
-  Wifi,
-  Zap,
   CheckCircle,
-  AlertTriangle,
-  ArrowRight,
-  ExternalLink,
-  Clock,
-  User,
   Cloud,
   Server,
 } from "lucide-react"
@@ -30,9 +21,6 @@ export default function HowItWorksPage() {
     { id: "hardware", title: "Hardware Setup", icon: Camera },
     { id: "machine-learning", title: "Machine Learning Model", icon: Code },
     { id: "cloud-infrastructure", title: "Cloud Infrastructure", icon: Cloud },
-    { id: "web-application", title: "Web Application", icon: Database },
-    { id: "challenges", title: "Challenges & Solutions", icon: AlertTriangle },
-    { id: "future", title: "Future Enhancements", icon: Zap },
   ]
 
   const technologies = [
@@ -85,7 +73,7 @@ export default function HowItWorksPage() {
               Table of Contents
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {tableOfContents.map((item, index) => (
+              {tableOfContents.map((item) => (
                 <button
                   key={item.id}
                   onClick={() => scrollToSection(item.id)}
