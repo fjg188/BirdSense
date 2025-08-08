@@ -36,7 +36,7 @@ export default function HomePage() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [initialLoading, setInitialLoading] = useState(true)
   const pageSize = 12; 
-  const load = process.env.LOAD_API_URL
+  const load = process.env.NEXT_PUBLIC_LOAD_API_URL
 
 const observer = useRef<IntersectionObserver | null>(null)
   const lastBirdElementRef = useCallback(
@@ -59,12 +59,13 @@ const observer = useRef<IntersectionObserver | null>(null)
   }, [])
 
   async function fetchBirdClassifications(cursor: string | null = null, limit = 12): Promise<apiResponse> {
+    const url = new URL(load!);
     url.searchParams.set("limit", String(limit));
     if (cursor) {
       url.searchParams.set("cursor", cursor);
     }
 
-    const res = await fetch(load!,{
+    const res = await fetch(url,{
       method: "GET",
         headers: {
             "Content-Type": "application/json",
