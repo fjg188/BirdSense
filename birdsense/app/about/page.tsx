@@ -262,7 +262,7 @@ export default function HowItWorksPage() {
             <Card>
               <CardContent className="p-6">
                 <img
-                  src="/placeholder.svg?height=300&width=400&text=Edge+Device+Setup"
+                  src="/placeholder.png?height=300&width=400&text=Edge+Device+Setup"
                   alt="Edge Device Hardware Setup"
                   className="w-full h-48 object-cover rounded-lg mb-4"
                 />
@@ -344,7 +344,7 @@ export default function HowItWorksPage() {
             <Card>
               <CardContent className="p-6">
                 <img
-                  src="/placeholder.svg?height=250&width=400&text=Swin+Transformer+Architecture"
+                  src="/placeholder.png?height=250&width=400&text=Swin+Transformer+Architecture"
                   alt="SwinT training"
                   className="w-full h-40 object-cover rounded-lg mb-4"
                 />
