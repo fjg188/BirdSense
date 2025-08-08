@@ -36,7 +36,7 @@ export default function HomePage() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [initialLoading, setInitialLoading] = useState(true)
   const pageSize = 12; 
-  const load = process.env.NEXT_PUBLIC_LOAD_API_URL
+  const load = process.env.LOAD_API_URL
 
 const observer = useRef<IntersectionObserver | null>(null)
   const lastBirdElementRef = useCallback(
@@ -65,7 +65,11 @@ const observer = useRef<IntersectionObserver | null>(null)
       url.searchParams.set("cursor", cursor);
     }
 
-    const res = await fetch(url.toString());
+    const res = await fetch(load!,{
+      method: "GET",
+        headers: {
+            "Content-Type": "application/json",
+        }},);
 
     return res.json();
   }
