@@ -66,10 +66,7 @@ const observer = useRef<IntersectionObserver | null>(null)
     }
 
     const res = await fetch(url,{
-      method: "GET",
-        headers: {
-            "Content-Type": "application/json",
-        }},);
+      method: "GET"});
 
     return res.json();
   }
