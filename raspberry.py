@@ -25,20 +25,21 @@ CLF_WEIGHT = PROJECT_DIR / "models" / "best_swin_cub.pth"
 CLASSES_FILE = PROJECT_DIR / "classes.txt"
 BACKBONE_NAME = "swin_base_patch4_window12_384"
 
-UPLOAD_URL_ENDPOINT = "https://yh5oyjgccj.execute-api.us-east-2.amazonaws.com/default/upload-URL"
-SAVE_META_ENDPOINT   = "https://yh5oyjgccj.execute-api.us-east-2.amazonaws.com/default/classify"
+#TODO make these "enviromental variabels" so they are hidden from github 
+UPLOAD_URL_ENDPOINT = "REDACTED" 
+SAVE_META_ENDPOINT   = "REDACTED"
 TIMEOUT = 15
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 LABELS = [ln.strip().split(" ", 1)[1] for ln in open(CLASSES_FILE)] if CLASSES_FILE.exists() else [str(i) for i in range(200)]
 
-# ───── Detection model ─────
+# Detection model
 
 detector = YOLO(str(DET_WEIGHT))
 detector.fuse()
 
-# ───── Classification model (Swin + BS head) ─────
+# Classification model (Swin + BS head)
 
 class BSHead(nn.Module):
     def __init__(self, in_ch: int, n_cls: int, k: int = 64):
@@ -61,14 +62,11 @@ class SwinBS(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.backbone.forward_features(x)
-        # Handle (B, L, C) tokens
         if feat.dim() == 3:
             b, l, c = feat.shape
             s = int(l ** 0.5)
             feat = feat.view(b, s, s, c).permute(0, 3, 1, 2).contiguous()
-        # Handle 4‑D feature maps that may be channels‑last
         elif feat.dim() == 4:
-            # If channels dimension isn't first, swap
             if feat.shape[1] != self.in_ch and feat.shape[-1] == self.in_ch:
                 feat = feat.permute(0, 3, 1, 2).contiguous()
         else:
@@ -81,9 +79,9 @@ state = torch.load(str(CLF_WEIGHT), map_location=DEVICE)
 classifier.load_state_dict(state, strict=True)
 classifier.eval()
 
-# ───── Pre‑processing ─────
+# Pre‑processing
 
-INPUT_SIZE = 384  # must match Swin "384" variant
+INPUT_SIZE = 384
 mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE).view(1, 3, 1, 1)
 std = torch.tensor([0.229, 0.224, 0.225], device=DEVICE).view(1, 3, 1, 1)
 
@@ -113,16 +111,15 @@ def detections_to_norfair(res) -> List[Detection]:
     if res.boxes is None or len(res.boxes) == 0:
         return []
 
-    xywh = res.boxes.xywh  # (N,4)  xc, yc, w, h
-    conf = res.boxes.conf  # (N,)
-    cls = res.boxes.cls.int()  # (N,)
+    xywh = res.boxes.xywh
+    conf = res.boxes.conf
+    cls = res.boxes.cls.int()
 
     dets: List[Detection] = []
     for (xc, yc, w, h), p, c in zip(xywh, conf, cls):
-        if c != 14:  # not a bird → skip
+        if c != 14:  # not a bird skip
             continue
 
-        # centre → corners
         x1 = (xc - w / 2).item();
         y1 = (yc - h / 2).item()
         x2 = (xc + w / 2).item();
@@ -163,7 +160,6 @@ def upload_classification(crop_bgr, species, confidence):
     _put_image(upload_url, crop_bgr)
     _save_meta(species, confidence, key)
 
-# ───── Main loop ─────
 
 def main():
     parser = argparse.ArgumentParser()
@@ -211,10 +207,8 @@ def main():
             if frame_bgr is None:
                 raise RuntimeError("Camera frame grab failed")
 
-            # Convert BGR→RGB once for detector and reuse for classification crops
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            #norfair tracking to only classify new birds in frame
             results = detector.predict(frame_rgb, device=str(DEVICE), conf=args.conf, verbose=False)
             centroids = detections_to_norfair(results[0])
 
