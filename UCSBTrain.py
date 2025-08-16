@@ -1,200 +1,191 @@
-
 import argparse
-import signal
-import threading
-from queue import Queue, Empty, Full
+import math
 from pathlib import Path
 
-import uuid
-from datetime import datetime, timezone
-import requests
-import cv2
-import numpy as np
+import pandas as pd
+from PIL import Image
+
 import torch
-from ultralytics import YOLO
-from norfair import Detection as NFDetection, Tracker
-from picamera2 import Picamera2
-from libcamera import controls
-from cachetools import TTLCache
-
-# ───── Paths & constants ─────
-HOME = Path.home()
-PROJECT_DIR = HOME / "birdcam"
-WEIGHTS_DIR = HOME / ".cache" / "ultralytics" / "hub" / "weights"
-DET_WEIGHT = WEIGHTS_DIR / "yolo11n.pt"
-CLS_WEIGHT = PROJECT_DIR / "models" / "best_swin_cub.pth"
-CLASSES_FILE = PROJECT_DIR / "classes.txt"
-LABELS = [ln.strip().split(" ", 1)[1] for ln in open(CLASSES_FILE)] if CLASSES_FILE.exists() else [str(i) for i in range(200)]
-
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-API_BASE   = os.getenv("BIRDCAM_API",   "https://yh5oyjgccj.execute-api.us-east-2.amazonaws.com/default/")
-TIMEOUT    = 40 # seconds
-
-# ───── Utility functions ─────
-
-def build_camera(width: int, height: int, fps: int):
-    cam = Picamera2()
-    config = cam.create_video_configuration(main={"size": (width, height)})
-    cam.configure(config)
-    cam.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-    cam.start()
-    return cam
-
-def get_signed_url(fname: str, content_type="image/jpeg") -> dict:
-    """POST → /v1/upload-url  → {'upload_url', 'object_url', 'key'}"""
-    resp = requests.post(
-        f"{API_BASE}/v1/upload-url",
-        json={"filename": fname, "content_type": content_type},
-        headers=HEADERS, timeout=TIMEOUT
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-def upload_image(signed: dict, data: bytes, content_type="image/jpeg") -> None:
-    resp = requests.put(
-        signed["upload_url"], data=data,
-        headers={"Content-Type": content_type}, timeout=TIMEOUT
-    )
-    resp.raise_for_status()
-
-def post_observation(species: str, conf: float, obj_url: str, ts: str) -> None:
-    payload = {
-        "species":    species,
-        "confidence": round(conf, 4),
-        "timestamp":  ts,
-        "image_url":  obj_url
-    }
-    resp = requests.post(f"{API_BASE}/v1/observations",
-                         json=payload, headers=HEADERS, timeout=TIMEOUT)
-    resp.raise_for_status()
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+import timm
 
 
-def detections_to_norfair(result, conf_threshold=0.25):
-    boxes = result.boxes
-    detections = []
-    if boxes is None:
-        return detections
-    xyxy = boxes.xyxy.cpu().numpy()
-    confs = boxes.conf.cpu().numpy()
-    mask = confs >= conf_threshold
-    xyxy = xyxy[mask]
-    confs = confs[mask]
-    if xyxy.size == 0:
-        return detections
-    centers = (xyxy[:, :2] + xyxy[:, 2:]) / 2
-    for (cx, cy), (x1, y1, x2, y2), c in zip(centers, xyxy, confs):
-        detections.append(
-            NFDetection(np.array([cx, cy]), scores=np.array([c]), data={"box": (x1, y1, x2, y2)})
-        )
-    return detections
+def get_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--data_root', type=Path, default=Path(__file__).parent / 'CUB_200_2011')
+    p.add_argument('--data_size', type=int, default=384)
+    p.add_argument('--num_workers', type=int, default=2)
+    p.add_argument('--bs', type=int, default=4)
+    p.add_argument('--accum', type=int, default=8)
+    p.add_argument('--epochs', type=int, default=80)
+    p.add_argument('--lr', type=float, default=5e-4)
+    p.add_argument('--wd', type=float, default=3e-4)
+    p.add_argument('--warmup_steps', type=int, default=1500)
+    p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--save', type=Path, default='best_swin_cub.pth')
+    p.add_argument('--log_dir', type=Path, default=Path('runs') / 'swin_cub')
+    return p.parse_args()
 
 
-@torch.inference_mode()
-def classify_crop(bgr_crop):
-    return None, 0.0
+class CUB(Dataset):
+    def __init__(self, df, images_dir: Path, size: int = 384, train: bool = True):
+        self.df = df.reset_index(drop=True)
+        self.images_dir = images_dir
+        norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        if train:
+            self.tf = T.Compose([
+                T.RandomResizedCrop(size, scale=(0.5, 1.0)),
+                T.RandAugment(2, 9),
+                T.ToTensor(),
+                norm,
+                T.RandomErasing(p=0.25),
+            ])
+        else:
+            self.tf = T.Compose([
+                T.Resize((size, size)),
+                T.ToTensor(),
+                norm,
+            ])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        r = self.df.iloc[idx]
+        img = Image.open(self.images_dir / r.path).convert('RGB')
+        return self.tf(img), int(r.class_id) - 1
 
 
-# ───── Main application ─────
+class BSHead(nn.Module):
+    def __init__(self, in_ch: int, n_cls: int, K: int = 64, lm: float = 1.0, ld: float = 5.0):
+        super().__init__()
+        self.cls = nn.Conv2d(in_ch, n_cls, 1)
+        self.K = K
+        self.lm = lm
+        self.ld = ld
 
-def main(args):
-    detector = YOLO(str(DET_WEIGHT))
-    detector.fuse()
-
-    cam = build_camera(args.width, args.height, args.fps)
-
-    frame_q: Queue[np.ndarray] = Queue(maxsize=4)
-    det_q: Queue[tuple[np.ndarray, object]] = Queue(maxsize=4)
-
-    running = threading.Event()
-    running.set()
-
-    # Thread 1: Capture
-    def capture_loop():
-        while running.is_set():
-            frame = cam.capture_array()
-            try:
-                frame_q.put(frame, timeout=0.01)
-            except Full:
-                continue
-
-    # Thread 2: Detect
-    def detect_loop():
-        while running.is_set():
-            try:
-                frame = frame_q.get(timeout=0.1)
-            except Empty:
-                continue
-            res = detector.predict(
-                frame,
-                device=0 if DEVICE.type == "cuda" else "cpu",
-                imgsz=args.imgsz,
-                conf=args.conf,
-                verbose=False,
-            )
-            try:
-                det_q.put((frame, res[0]), timeout=0.01)
-            except Full:
-                continue
-
-    cap_thread = threading.Thread(target=capture_loop, daemon=True)
-    det_thread = threading.Thread(target=detect_loop, daemon=True)
-    cap_thread.start()
-    det_thread.start()
-
-    tracker = Tracker(distance_function=lambda a, b: np.linalg.norm(a.points - b.points), distance_threshold=30)
-    seen = TTLCache(maxsize=512, ttl=30)
-
-    def handle_exit(sig, _):
-        running.clear()
-
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-
-    # Thread 3: Classify + display (main)
-    while running.is_set():
-        try:
-            frame, det_result = det_q.get(timeout=0.1)
-        except Empty:
-            continue
-
-        detections = detections_to_norfair(det_result, args.conf)
-        tracked = tracker.update(detections)
-
-        for trk in tracked:
-            x1, y1, x2, y2 = trk.last_detection.data["box"]
-            tid = trk.id
-
-            if tid not in seen:
-                crop = frame[int(y1): int(y2), int(x1): int(x2)]
-                if crop.size:
-                    cls_idx, cls_conf = classify_crop(crop)
-                    seen[tid] = (cls_idx, cls_conf)
-
-            cls_idx, cls_conf = seen.get(tid, (None, 0.0))
-            label = LABELS[cls_idx] if cls_idx is not None else f"ID {tid}"
-            txt = f"{label} {cls_conf:.2f}" if cls_idx is not None else label
-
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(frame, txt, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        cv2.imshow("BirdCam", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            running.clear()
-
-    cap_thread.join()
-    det_thread.join()
-    cam.stop()
-    cam.close()
-    cv2.destroyAllWindows()
+    def forward(self, feat, target=None):
+        logits_map = self.cls(feat)
+        topk = logits_map.flatten(2).topk(self.K, dim=2).values.mean(-1)
+        logits = topk
+        loss = torch.zeros((), device=feat.device)
+        if self.training and target is not None:
+            loss_m = F.cross_entropy(logits, target)
+            loss_d = ((torch.tanh(logits_map) + 1) ** 2).mean()
+            loss = self.lm * loss_m + self.ld * loss_d
+        return logits, loss
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Three‑stage threaded birdcam pipeline")
-    ap.add_argument("--width", type=int, default=1280, help="Frame width")
-    ap.add_argument("--height", type=int, default=720, help="Frame height")
-    ap.add_argument("--fps", type=int, default=30, help="Camera FPS")
-    ap.add_argument("--imgsz", type=int, default=640, help="YOLO inference size")
-    ap.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
-    args = ap.parse_args()
-    main(args)
+class SwinBS(nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.backbone = timm.create_model('swin_base_patch4_window12_384', pretrained=True, num_classes=0)
+        self.bs = BSHead(1024, num_classes)
+
+    def forward(self, x, y=None):
+        feat = self.backbone.forward_features(x)
+        feat = feat.permute(0, 3, 1, 2).contiguous()
+        return self.bs(feat, y)
+
+
+def lr_scale(step: int, total: int, warmup: int):
+    if step < warmup:
+        return step / warmup
+    pct = (step - warmup) / (total - warmup)
+    return 0.5 * (1 + math.cos(math.pi * pct))
+
+
+def run_epoch(model, loader, optim, scaler, device, train: bool, accum: int, schedule_fn=None):
+    model.train() if train else model.eval()
+    loss_sum = acc_sum = num = 0
+    optim.zero_grad(set_to_none=True)
+    last_step = len(loader) - 1
+    for step, (x, y) in enumerate(loader):
+        x, y = x.to(device), y.to(device)
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            logits, bs_loss = model(x, y if train else None)
+            ce = F.cross_entropy(logits, y, label_smoothing=0.1)
+            loss = ce + bs_loss
+        acc = (logits.argmax(1) == y).float().mean().item()
+        loss_sum += loss.item() * x.size(0)
+        acc_sum += acc * x.size(0)
+        num += x.size(0)
+        if train:
+            scaled_loss = scaler.scale(loss / accum) if scaler else loss / accum
+            scaled_loss.backward()
+            if (step + 1) % accum == 0 or step == last_step:
+                if scaler:
+                    scaler.step(optim)
+                    scaler.update()
+                else:
+                    optim.step()
+                optim.zero_grad(set_to_none=True)
+                if schedule_fn is not None:
+                    schedule_fn()
+    return loss_sum / num, acc_sum / num
+
+
+def load_cub_dataframe(root: Path):
+    images = pd.read_csv(root / 'images.txt', sep=' ', names=['id', 'path'])
+    labels = pd.read_csv(root / 'image_class_labels.txt', sep=' ', names=['id', 'class_id'])
+    split = pd.read_csv(root / 'train_test_split.txt', sep=' ', names=['id', 'is_train'])
+    boxes = pd.read_csv(root / 'bounding_boxes.txt', sep=' ', names=['id', 'x', 'y', 'bb_width', 'bb_height'])
+    return images.merge(labels).merge(split).merge(boxes)
+
+
+def main():
+    args = get_args()
+    device = torch.device(args.device)
+    torch.backends.cudnn.benchmark = True
+    args.log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(str(args.log_dir))
+
+    df = load_cub_dataframe(args.data_root)
+    train_df = df[df.is_train == 1]
+    val_df = df[df.is_train == 0]
+
+    img_dir = args.data_root / 'images'
+    train_ds = CUB(train_df, img_dir, args.data_size, train=True)
+    val_ds = CUB(val_df, img_dir, args.data_size, train=False)
+
+    train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    val_dl = DataLoader(val_ds, batch_size=args.bs * 2, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    model = SwinBS(df.class_id.nunique()).to(device)
+
+    optim = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wd)
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+
+    total_opt_steps = args.epochs * math.ceil(len(train_dl) / args.accum)
+    current_step = 0
+
+    def scheduler():
+        nonlocal current_step
+        current_step += 1
+        lr = lr_scale(current_step, total_opt_steps, args.warmup_steps) * args.lr
+        for pg in optim.param_groups:
+            pg['lr'] = lr
+
+    best_val = 0.0
+    for epoch in range(1, args.epochs + 1):
+        tr_loss, tr_acc = run_epoch(model, train_dl, optim, scaler, device, True, args.accum, scheduler)
+        val_loss, val_acc = run_epoch(model, val_dl, optim, scaler, device, False, args.accum)
+        writer.add_scalar('Loss/train', tr_loss, epoch)
+        writer.add_scalar('Acc/train', tr_acc, epoch)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('Acc/val', val_acc, epoch)
+        writer.add_scalar('LR', optim.param_groups[0]['lr'], epoch)
+        if val_acc > best_val:
+            best_val = val_acc
+            torch.save(model.state_dict(), args.save)
+        print(f"{epoch:02d}/{args.epochs} tr_acc {tr_acc:.3f} val_acc {val_acc:.3f} best {best_val:.3f}")
+
+    writer.close()
+
+
+if __name__ == '__main__':
+    main()
