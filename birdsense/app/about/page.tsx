@@ -99,12 +99,11 @@ export default function HowItWorksPage() {
 
           <div className="prose prose-lg max-w-none mb-8">
             <p className="text-gray-700 leading-relaxed mb-6">
-              I decided I wanted to build BirdSense to help my dad identify all the different specicies of 
-              birds that visit our bird feeders in our backyard. I also wanted to build something with machine learning and computer vision
-              and those things interst me and I wanted to learn more about them. what begain as simple curioisity quickly evolved into this fully fleged project, invloving reading research papers, 
-              training my own neural network, using a raspberry pi and through that learning about linux, and desinigng a website. I had no idea how challanging but also
-              how rewarding it would be. I learned a emense amount about machine learning, computer vision, system architecture, and cloud infasturture. The end result is more than anything I could have 
-              imagined I could have built. The model achieves roughly 92% accuracy on over 200 species of birds. 
+              I decided to build BirdSense to help my dad identify all the different species of birds that visit our bird feeders in our backyard. I also wanted to build something with machine learning and computer vision, 
+              since those fields interest me and I wanted to learn more about them. What began as simple curiosity quickly evolved into a fully fledged project, involving reading research papers, training my own neural network, 
+              using a Raspberry Pi (and through that learning about Linux), and designing a website.
+              I had no idea how challenging—but also how rewarding—it would be. I learned an immense amount about machine learning, computer vision, system architecture, and cloud infrastructure. The end result is beyond anything 
+              I could have imagined building. The model achieves roughly 92% accuracy on over 200 species of birds.
 
             </p>
 
