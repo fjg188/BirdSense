@@ -421,7 +421,7 @@ export default function HowItWorksPage() {
                 {/*GitHub Link */}
         <div className="text-center mb-8">
           <a
-            href="https://github.com/FelixjGrimm118/BirdSense"
+            href="https://github.com/fjg188/BirdSense"
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex items-center space-x-2 text-emerald-600 hover:text-emerald-700 transition-colors duration-200 text-lg font-medium group"
